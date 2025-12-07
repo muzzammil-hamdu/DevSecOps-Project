@@ -7,7 +7,7 @@ pool:
   name: 'self-hosted-linux'
 
 variables:
-  acrLoginServer: 'YOUR_ACR_NAME.azurecr.io'
+  acrLoginServer: 'hamduacr.azurecr.io'
   imageName: 'netflix-app'
   gitOpsRepoSsh: 'git@github.com:muzzammil-hamdu/devsecops-manifests.git'
   gitOpsBranch: 'main'
