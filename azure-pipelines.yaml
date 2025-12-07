@@ -1,0 +1,123 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  name: 'self-hosted-linux'
+
+variables:
+  acrLoginServer: 'YOUR_ACR_NAME.azurecr.io'
+  imageName: 'netflix-app'
+  gitOpsRepoSsh: 'git@github.com:muzzammil-hamdu/devsecops-manifests.git'
+  gitOpsBranch: 'main'
+  gitOpsDeploymentFile: 'k8s/netflix/deployment.yaml'
+
+  sonarProjectKey: 'Netflix'
+  sonarProjectName: 'Netflix'
+  tmdbApiKey: '$(TMDB_V3_API_KEY)'
+
+stages:
+
+# ============= BUILD + SECURITY SCAN =================
+- stage: Build_Scan
+  jobs:
+  - job: build_and_scan
+    steps:
+    - checkout: self
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+      displayName: 'Use Node 18'
+
+    - script: |
+        npm install
+        npm run build
+      displayName: 'Install & Build'
+
+    # SonarQube
+    - task: SonarQubePrepare@5
+      inputs:
+        SonarQube: 'SonarQubeServiceConnection'
+        scannerMode: 'CLI'
+        configMode: 'file'
+
+    - task: SonarQubeAnalyze@5
+    - task: SonarQubePublish@5
+      inputs:
+        pollingTimeoutSec: '300'
+
+    # OWASP Dependency Check
+    - script: |
+        chmod +x scripts/run-dependency-check.sh
+        ./scripts/run-dependency-check.sh
+      displayName: "OWASP Dependency Check"
+
+    # Trivy FS scan
+    - script: |
+        trivy fs . --exit-code 0 --format table > trivy-fs.txt || true
+    - publish: trivy-fs.txt
+      artifact: trivy-fs
+
+# ============= DOCKER BUILD + TRIVY IMAGE SCAN + PUSH =================
+- stage: Docker_Image
+  dependsOn: Build_Scan
+  jobs:
+  - job: docker_build_push
+    steps:
+    - checkout: self
+
+    - task: Docker@2
+      inputs:
+        command: 'login'
+        containerRegistry: 'AcrServiceConnection'
+
+    - task: Docker@2
+      inputs:
+        command: 'buildAndPush'
+        repository: '$(imageName)'
+        dockerfile: '**/Dockerfile'
+        containerRegistry: 'AcrServiceConnection'
+        buildContext: '$(Build.SourcesDirectory)'
+        tags: |
+          $(Build.BuildId)
+        arguments: '--build-arg TMDB_V3_API_KEY=$(tmdbApiKey)'
+
+    # Trivy image scan
+    - script: |
+        trivy image "$(acrLoginServer)/$(imageName):$(Build.BuildId)" \
+        --exit-code 0 --format table > trivy-image.txt || true
+      displayName: "Trivy Image Scan"
+
+# ============= GITOPS UPDATE =================
+- stage: GitOps_Update
+  dependsOn: Docker_Image
+  jobs:
+  - job: gitops_update
+    steps:
+
+    - task: InstallSSHKey@0
+      inputs:
+        sshPublicKey: '$(GITOPS_SSH_PUBLIC_KEY)'
+        sshKeySecureFile: 'gitops_ssh_private'
+        knownHostsEntry: 'github.com'
+
+    - script: |
+        git clone $(gitOpsRepoSsh) gitops
+        cd gitops
+        git checkout $(gitOpsBranch)
+
+        NEW_IMAGE="$(acrLoginServer)/$(imageName):$(Build.BuildId)"
+        echo "New image: $NEW_IMAGE"
+
+        cp ../scripts/update-manifests.sh .
+        chmod +x update-manifests.sh
+        ./update-manifests.sh "$(gitOpsDeploymentFile)" "$NEW_IMAGE"
+
+        git config user.email "azure-pipelines@local"
+        git config user.name "azure-pipelines"
+
+        git commit -am "Update to image tag $(Build.BuildId)" || true
+        git push origin $(gitOpsBranch)
+      displayName: "Update deployment.yaml with new image"
