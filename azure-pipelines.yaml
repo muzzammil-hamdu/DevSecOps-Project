@@ -4,7 +4,7 @@ trigger:
       - main
 
 pool:
-  name: 'self-hosted-linux'
+  name: 'self-hosted-linux'        # your agent pool name
 
 variables:
   acrLoginServer: 'hamduacr.azurecr.io'
@@ -19,63 +19,86 @@ variables:
 
 stages:
 
-# ============= BUILD + SECURITY SCAN =================
+# ===================================================================
+#  1️⃣ BUILD + SECURITY SCANS (Sonar + Trivy FS + OWASP)
+# ===================================================================
 - stage: Build_Scan
+  displayName: 'Build + Sonar + Trivy + OWASP'
   jobs:
   - job: build_and_scan
+    displayName: 'Build and Scan'
     steps:
-    - checkout: self
 
+    - checkout: self
+      clean: true
+
+    # ---------------- Node Setup ----------------
     - task: NodeTool@0
       inputs:
         versionSpec: '18.x'
-      displayName: 'Use Node 18'
+      displayName: 'Use Node.js 18'
 
     - script: |
         npm install
         npm run build
-      displayName: 'Install & Build'
+      displayName: 'Install & Build App'
 
-    # SonarQube
+    # ---------------- Sonar Prepare ----------------
     - task: SonarQubePrepare@5
+      displayName: 'Prepare SonarQube Analysis'
       inputs:
         SonarQube: 'SonarQubeServiceConnection'
         scannerMode: 'CLI'
-        configMode: 'file'
+        configMode: 'file'        # uses sonar-project.properties
 
     - task: SonarQubeAnalyze@5
+      displayName: 'Run SonarQube Analysis'
+
     - task: SonarQubePublish@5
+      displayName: 'Publish SonarQube Quality Gate'
       inputs:
         pollingTimeoutSec: '300'
 
-    # OWASP Dependency Check
+    # ---------------- Trivy Filesystem Scan ----------------
     - script: |
-        chmod +x scripts/run-dependency-check.sh
-        ./scripts/run-dependency-check.sh
-      displayName: "OWASP Dependency Check"
-
-    # Trivy FS scan
-    - script: |
+        echo "Running Trivy filesystem scan..."
         trivy fs . --exit-code 0 --format table > trivy-fs.txt || true
     - publish: trivy-fs.txt
       artifact: trivy-fs
 
-# ============= DOCKER BUILD + TRIVY IMAGE SCAN + PUSH =================
+    # ---------------- OWASP Dependency Check ----------------
+    - script: |
+        chmod +x scripts/run-dependency-check.sh
+        ./scripts/run-dependency-check.sh
+      displayName: 'OWASP Dependency-Check Scan'
+
+
+# ===================================================================
+#  2️⃣ DOCKER BUILD + TRIVY IMAGE SCAN + PUSH TO ACR
+# ===================================================================
 - stage: Docker_Image
+  displayName: 'Build Docker Image & Push to ACR'
   dependsOn: Build_Scan
   jobs:
   - job: docker_build_push
+    displayName: 'Docker Build & Push'
     steps:
-    - checkout: self
 
+    - checkout: self
+      clean: true
+
+    # ---------------- ACR Login ----------------
     - task: Docker@2
+      displayName: 'Login to ACR'
       inputs:
-        command: 'login'
+        command: login
         containerRegistry: 'AcrServiceConnection'
 
+    # ---------------- Build & Push Image ----------------
     - task: Docker@2
+      displayName: 'Build & Push Docker Image'
       inputs:
-        command: 'buildAndPush'
+        command: buildAndPush
         repository: '$(imageName)'
         dockerfile: '**/Dockerfile'
         containerRegistry: 'AcrServiceConnection'
@@ -84,32 +107,43 @@ stages:
           $(Build.BuildId)
         arguments: '--build-arg TMDB_V3_API_KEY=$(tmdbApiKey)'
 
-    # Trivy image scan
+    # ---------------- Trivy Image Scan ----------------
     - script: |
-        trivy image "$(acrLoginServer)/$(imageName):$(Build.BuildId)" \
-        --exit-code 0 --format table > trivy-image.txt || true
-      displayName: "Trivy Image Scan"
+        echo "Running Trivy image scan..."
+        IMAGE="$(acrLoginServer)/$(imageName):$(Build.BuildId)"
+        trivy image "$IMAGE" --exit-code 0 --format table > trivy-image.txt || true
+    - publish: trivy-image.txt
+      artifact: trivy-image
 
-# ============= GITOPS UPDATE =================
+
+# ===================================================================
+#  3️⃣ UPDATE GITOPS REPO (ArgoCD Auto Deploys)
+# ===================================================================
 - stage: GitOps_Update
+  displayName: 'Update K8s Manifests Repo (GitOps)'
   dependsOn: Docker_Image
   jobs:
   - job: gitops_update
+    displayName: 'Patch Deployment Image Tag in GitOps Repo'
     steps:
 
+    # ---------------- SSH Key for GitOps Repo ----------------
     - task: InstallSSHKey@0
+      displayName: 'Install GitOps SSH Key'
       inputs:
         sshPublicKey: '$(GITOPS_SSH_PUBLIC_KEY)'
         sshKeySecureFile: 'gitops_ssh_private'
         knownHostsEntry: 'github.com'
 
+    # ---------------- Clone GitOps Repo & Update Manifest ----------------
     - script: |
+        echo "Cloning GitOps repo..."
         git clone $(gitOpsRepoSsh) gitops
         cd gitops
         git checkout $(gitOpsBranch)
 
         NEW_IMAGE="$(acrLoginServer)/$(imageName):$(Build.BuildId)"
-        echo "New image: $NEW_IMAGE"
+        echo "Updating image to: $NEW_IMAGE"
 
         cp ../scripts/update-manifests.sh .
         chmod +x update-manifests.sh
@@ -118,6 +152,6 @@ stages:
         git config user.email "azure-pipelines@local"
         git config user.name "azure-pipelines"
 
-        git commit -am "Update to image tag $(Build.BuildId)" || true
-        git push origin $(gitOpsBranch)
-      displayName: "Update deployment.yaml with new image"
+        git commit -am "Update image to $(Build.BuildId)" || echo "No changes to commit."
+        git push origin $(gitOpsBranch) || echo "Nothing to push."
+      displayName: 'Update Deployment Manifest with New Image'
